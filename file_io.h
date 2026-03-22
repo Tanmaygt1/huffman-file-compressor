@@ -33,4 +33,13 @@ int compressFile(const char *inputPath,
                  unsigned int freq[BYTE_RANGE],
                  long originalSize);
 
+/*
+ * decompressFile
+ * Reads a .huff compressed file, reconstructs the Huffman tree
+ * from the stored frequency table in the header, then decodes
+ * the bit stream back to the original file byte by byte.
+ * Returns 0 on success, -1 on error.
+ */
+int decompressFile(const char *inputPath, const char *outputPath);
+
 #endif /* FILE_IO_H */

@@ -188,3 +188,181 @@ int compressFile(const char *inputPath,
     fclose(out);
     return 0;
 }
+
+/* ============================================================
+   DECOMPRESSION — Read .huff file and restore original file
+   ============================================================ */
+
+/*
+ * readU32
+ * Reads 4 bytes from the file and assembles them into an
+ * unsigned int using little-endian order (same as writeU32).
+ */
+static unsigned int readU32(FILE *fp)
+{
+    unsigned char b[4];
+    if (fread(b, 1, 4, fp) != 4) return 0;
+    return (unsigned int)b[0]
+         | ((unsigned int)b[1] << 8)
+         | ((unsigned int)b[2] << 16)
+         | ((unsigned int)b[3] << 24);
+}
+
+/*
+ * readU64
+ * Reads 8 bytes from the file and assembles them into an
+ * unsigned long using little-endian order (same as writeU64).
+ */
+static unsigned long readU64(FILE *fp)
+{
+    unsigned char b[8];
+    if (fread(b, 1, 8, fp) != 8) return 0;
+    unsigned long v = 0;
+    int i;
+    for (i = 7; i >= 0; i--)
+        v = (v << 8) | b[i];
+    return v;
+}
+
+/*
+ * readBit
+ * Reads one bit at a time from the file by buffering a full byte
+ * and serving its bits one by one from the most-significant side.
+ * Returns 0 or 1 on success, -1 on end of file.
+ *
+ * Uses static variables so state is preserved between calls.
+ * Call resetReadBit() before starting a new decompression.
+ */
+static unsigned char readBuf   = 0;  /* Byte currently being consumed    */
+static int           readCount = 0;  /* Bits remaining in readBuf        */
+
+static void resetReadBit(void)
+{
+    readBuf   = 0;
+    readCount = 0;
+}
+
+static int readBit(FILE *fp)
+{
+    /* Load the next byte when the current one is exhausted */
+    if (readCount == 0) {
+        if (fread(&readBuf, 1, 1, fp) != 1)
+            return -1;   /* End of file */
+        readCount = 8;
+    }
+
+    /* Extract the most-significant bit */
+    int bit = (readBuf >> 7) & 1;
+    readBuf   = (unsigned char)(readBuf << 1);
+    readCount--;
+    return bit;
+}
+
+/*
+ * decompressFile
+ *
+ * How decompression works:
+ *
+ * 1. Open the .huff file and read the header:
+ *      - 8 bytes  → original file size
+ *      - 1024 bytes → frequency table (256 × 4 bytes)
+ *
+ * 2. Rebuild the exact same Huffman tree using the frequency
+ *    table (buildHuffmanTree gives the same tree every time
+ *    for the same frequency table).
+ *
+ * 3. Read the compressed bit stream bit by bit.
+ *    Walk the tree: bit=0 → go left, bit=1 → go right.
+ *    When a leaf node is reached → write that byte to output.
+ *    Reset back to root and repeat.
+ *
+ * 4. Stop when we have written exactly originalSize bytes
+ *    (this handles the padding bits at the end correctly).
+ */
+int decompressFile(const char *inputPath, const char *outputPath)
+{
+    /* ── 1. Open the compressed file ────────────────────── */
+    FILE *in = fopen(inputPath, "rb");
+    if (!in) {
+        fprintf(stderr, "Error: cannot open compressed file '%s'\n", inputPath);
+        return -1;
+    }
+
+    /* ── 2. Read header: original file size ─────────────── */
+    unsigned long originalSize = readU64(in);
+    if (originalSize == 0) {
+        fprintf(stderr, "Error: compressed file is empty or corrupt.\n");
+        fclose(in);
+        return -1;
+    }
+
+    /* ── 3. Read header: frequency table ────────────────── */
+    unsigned int freq[BYTE_RANGE];
+    int i;
+    for (i = 0; i < BYTE_RANGE; i++)
+        freq[i] = readU32(in);
+
+    /* ── 4. Rebuild the Huffman tree ─────────────────────── */
+    HuffmanNode *root = buildHuffmanTree(freq);
+    if (!root) {
+        fprintf(stderr, "Error: could not rebuild Huffman tree.\n");
+        fclose(in);
+        return -1;
+    }
+
+    /* ── 5. Open output file ─────────────────────────────── */
+    FILE *out = fopen(outputPath, "wb");
+    if (!out) {
+        fprintf(stderr, "Error: cannot create output file '%s'\n", outputPath);
+        freeTree(root);
+        fclose(in);
+        return -1;
+    }
+
+    /* ── 6. Decode the bit stream ────────────────────────── */
+    resetReadBit();
+
+    unsigned long decoded = 0;       /* How many bytes written so far  */
+    HuffmanNode *current  = root;    /* Start walking from the root    */
+
+    while (decoded < originalSize) {
+        int bit = readBit(in);
+        if (bit < 0) {
+            /* Unexpected end of file before restoring all bytes */
+            fprintf(stderr, "Error: compressed data ended too early.\n");
+            break;
+        }
+
+        /* Walk left for 0, right for 1 */
+        if (bit == 0)
+            current = current->left;
+        else
+            current = current->right;
+
+        /* Safety check for corrupt data */
+        if (!current) {
+            fprintf(stderr, "Error: corrupt compressed file.\n");
+            break;
+        }
+
+        /* Reached a leaf node — this is a decoded byte */
+        if (!current->left && !current->right) {
+            fputc(current->byte, out);   /* Write the original byte    */
+            decoded++;
+            current = root;              /* Reset to root for next byte */
+        }
+    }
+
+    /* ── 7. Clean up ─────────────────────────────────────── */
+    fclose(in);
+    fclose(out);
+    freeTree(root);
+
+    if (decoded != originalSize) {
+        fprintf(stderr, "Warning: expected %lu bytes but decoded %lu.\n",
+                originalSize, decoded);
+        return -1;
+    }
+
+    return 0;
+}
